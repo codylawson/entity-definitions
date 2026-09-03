@@ -1,59 +1,119 @@
 relationships:
   - name: k8sHostHostsPod
+    # reportingAgent is the entityKey of the HOST entity the reporting agent
+    # represents, so the node GUID can be built directly - no candidate lookup.
+    # This holds whichever identity the agent resolved (cloud instance id,
+    # machine-id or hostname fallback), which is why no fullHostname fallback
+    # rule is needed here.
     version: "1"
     origins:
       - Kubernetes Integration
     conditions:
       - attribute: eventType
         anyOf: [ "K8sPodSample" ]
+      # Pending pods are surfaced by the KSM scraper with nodeName="", and their
+      # reportingAgent is the KSM node rather than the pod's node. Skip them.
+      - attribute: nodeName
+        regex: ".+"
     relationship:
       expires: PT75M
       relationshipType: HOSTS
       source:
-        extractGuid:
-          attribute: host.guid
-          entityType:
+        buildGuid:
+          account:
+            lookup: true
+          domain:
+            value: INFRA
+          type:
             value: HOST
+            valueInGuid: NA
+          identifier:
+            fragments:
+              - attribute: reportingAgent
+            hashAlgorithm: FARM_HASH
       target:
         extractGuid:
           attribute: entityGuid
           entityType:
             value: KUBERNETES_POD
-  - name: otelKsmK8sHostHostsPod
-    # use kube-state-metrics system metric
+  - name: otelK8sHostHostsPod
+    # preferred OTel path: kubeletstats (DaemonSet collector) pod metrics carry
+    # the pod's own node host.id, because kubeletstats scrapes the local
+    # kubelet. Both GUIDs can therefore be built - no candidate lookup. Covers
+    # 7 of the 8 OTel clusters on staging that have a HOST entity at all.
     version: "1"
-    origins: 
+    origins:
       - OpenTelemetry
     conditions:
       - attribute: metricName
-        startsWith: system.
-      - attribute: eventType
-        anyOf: [ "Metric" ]
-      - attribute: newrelic.source
-        anyOf: [ "api.metrics.otlp" ]
-      # if service.name is present, it's a service, not a host
-      - attribute: service.name
-        present: false
-      # if container.id is present, it's a container, not a host
-      - attribute: container.id
-        present: false
-      - attribute: k8s.cluster.name
+        anyOf: [ "k8s.pod.memory.working_set" ]
+      - attribute: host.id
         present: true
     relationship:
-      expires: PT2H
+      expires: PT75M
       relationshipType: HOSTS
       source:
-        extractGuid:
-          attribute: host.guid
-          entityType:
+        buildGuid:
+          account:
+            lookup: true
+          domain:
+            value: INFRA
+          type:
             value: HOST
+            valueInGuid: NA
+          identifier:
+            fragments:
+              - attribute: host.id
+            hashAlgorithm: FARM_HASH
       target:
+        buildGuid:
+          account:
+            lookup: true
+          domain:
+            value: INFRA
+          type:
+            value: KUBERNETES_POD
+          identifier:
+            fragments:
+              - attribute: k8s.cluster.name
+              - value: ":"
+              - attribute: k8s.namespace.name
+              - value: ":"
+              - attribute: k8s.pod.name
+            hashAlgorithm: FARM_HASH
+  - name: otelKsmK8sHostHostsPod
+    # fallback for KSM-only OTel deployments (kube-state-metrics + hostmetrics,
+    # no kubeletstats DaemonSet). kube_pod_info names the node only by
+    # k8s.node.name while the OTel HOST identifier is host.id, so the host GUID
+    # cannot be built here and a candidate lookup is the only option. Kept
+    # because dropping it silently removes the relationship for that topology -
+    # otel-linkerd-demo (acct 1015429) is a live example. This path is ~0.05%
+    # of K8sPodSample volume, so the lookup cost is immaterial next to the
+    # Kubernetes Integration rule above.
+    version: "1"
+    origins:
+      - OpenTelemetry
+    conditions:
+      - attribute: metricName
+        anyOf: [ "kube_pod_info" ]
+      # regex rather than `present: true`: 3% of kube_pod_info rows carry
+      # k8s.node.name="" (unscheduled pods), which `present` does not screen
+      # and which would look up the empty string.
+      - attribute: k8s.node.name
+        regex: ".+"
+    relationship:
+      expires: PT75M
+      relationshipType: HOSTS
+      source:
         lookupGuid:
-          candidateCategory: KUBERNETES_POD
+          candidateCategory: HOST
           fields:
-            - field: k8s.node.name # node name of host
-              attribute: host.name # node name of pod
-            - field: k8s.namespace.name # namespace of host
-              attribute: k8s.namespace.name # namespace of pod
-            - field: k8s.cluster.name # cluster of host
-              attribute: k8s.cluster.name # cluster of pod
+            - field: host.name
+              attribute: k8s.node.name
+            - field: cluster.name
+              attribute: k8s.cluster.name
+      target:
+        extractGuid:
+          attribute: entity.guid
+          entityType:
+            value: KUBERNETES_POD
